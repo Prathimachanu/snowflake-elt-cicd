@@ -1,0 +1,3 @@
+-- A stream remembers which raw rows are new
+CREATE STREAM IF NOT EXISTS RAW.WEATHER_STREAM
+  ON TABLE RAW.WEATHER_RAW APPEND_ONLY = TRUE;

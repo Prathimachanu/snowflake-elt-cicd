@@ -1,0 +1,41 @@
+-- Runs every minute, but only does work when the stream has new rows
+CREATE OR REPLACE TASK CORE.LOAD_WEATHER_TASK
+  WAREHOUSE = DEMO_WH
+  SCHEDULE = '1 MINUTE'
+  WHEN SYSTEM$STREAM_HAS_DATA('RAW.WEATHER_STREAM')
+AS
+EXECUTE IMMEDIATE $$
+BEGIN
+  -- 1) take the new rows out of the stream
+  CREATE OR REPLACE TEMPORARY TABLE CORE.TMP_WEATHER AS
+    SELECT V:city::STRING          AS CITY,
+           V:latitude::FLOAT       AS LATITUDE,
+           V:longitude::FLOAT      AS LONGITUDE,
+           V:temperature::FLOAT    AS TEMPERATURE,
+           V:windspeed::FLOAT      AS WINDSPEED,
+           V:fetched_at::TIMESTAMP_NTZ AS FETCHED_AT
+    FROM RAW.WEATHER_STREAM;
+
+  -- 2) SCD2 step A: close the current row if the city's attributes changed
+  UPDATE CORE.DIM_CITY d
+     SET VALID_TO = CURRENT_TIMESTAMP(), IS_CURRENT = FALSE
+    FROM (SELECT DISTINCT CITY, LATITUDE, LONGITUDE FROM CORE.TMP_WEATHER) t
+   WHERE d.CITY = t.CITY AND d.IS_CURRENT
+     AND (d.LATITUDE <> t.LATITUDE OR d.LONGITUDE <> t.LONGITUDE);
+
+  -- 3) SCD2 step B: insert new cities and the new version of changed ones
+  INSERT INTO CORE.DIM_CITY (CITY, LATITUDE, LONGITUDE)
+    SELECT DISTINCT t.CITY, t.LATITUDE, t.LONGITUDE
+    FROM CORE.TMP_WEATHER t
+    LEFT JOIN CORE.DIM_CITY d ON d.CITY = t.CITY AND d.IS_CURRENT
+    WHERE d.CITY IS NULL;
+
+  -- 4) Fact rows point to the current dimension row
+  INSERT INTO CORE.FACT_WEATHER (CITY_KEY, TEMPERATURE, WINDSPEED, FETCHED_AT)
+    SELECT d.CITY_KEY, t.TEMPERATURE, t.WINDSPEED, t.FETCHED_AT
+    FROM CORE.TMP_WEATHER t
+    JOIN CORE.DIM_CITY d ON d.CITY = t.CITY AND d.IS_CURRENT;
+END;
+$$;
+-- GO
+ALTER TASK CORE.LOAD_WEATHER_TASK RESUME;

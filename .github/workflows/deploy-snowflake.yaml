@@ -1,0 +1,118 @@
+name: Snowflake CI/CD
+
+# A deploy happens ONLY when a release branch is merged into dev / qa / main.
+# The merge commit message ("Merge pull request #N from user/dev_release_20261023")
+# tells the pipeline which environment and which release this is.
+# Pushes with any other message do NOT deploy (the deploy job is skipped).
+
+on:
+  push:
+    branches: [dev, qa, main]
+  workflow_dispatch:
+    inputs:
+      release_date:
+        description: "Optional release date YYYYMMDD (if given, the next release branch is created after deploy)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  detect-env:
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      target_env: ${{ steps.check.outputs.target_env }}
+      release_date: ${{ steps.check.outputs.release_date }}
+    steps:
+      - id: check
+        env:
+          BRANCH: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          INPUT_DATE: ${{ github.event.inputs.release_date }}
+        run: |
+          SHOULD_DEPLOY="false"; RELEASE_DATE=""
+          case "$BRANCH" in
+            dev)  TARGET_ENV="dev";  PREFIX="dev_release"  ;;
+            qa)   TARGET_ENV="qa";   PREFIX="qa_release"   ;;
+            main) TARGET_ENV="prod"; PREFIX="prod_release" ;;
+            *)    TARGET_ENV="";     PREFIX=""             ;;
+          esac
+
+          if [[ -n "$TARGET_ENV" && "$EVENT" == "workflow_dispatch" ]]; then
+            SHOULD_DEPLOY="true"; RELEASE_DATE="$INPUT_DATE"
+          elif [[ -n "$TARGET_ENV" && "$COMMIT_MSG" =~ ${PREFIX}_([0-9]{8}) ]]; then
+            SHOULD_DEPLOY="true"; RELEASE_DATE="${BASH_REMATCH[1]}"
+          fi
+
+          echo "branch=$BRANCH env=$TARGET_ENV deploy=$SHOULD_DEPLOY release=$RELEASE_DATE"
+          echo "should_deploy=$SHOULD_DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "target_env=$TARGET_ENV"       >> "$GITHUB_OUTPUT"
+          echo "release_date=$RELEASE_DATE"   >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: detect-env
+    if: needs.detect-env.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    # GitHub Environment (dev / qa / prod) = the approval gate.
+    environment: ${{ needs.detect-env.outputs.target_env }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install snowflake-connector-python cryptography
+
+      - name: Deploy to Snowflake
+        env:
+          TARGET_ENV: ${{ needs.detect-env.outputs.target_env }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: python scripts/deploy.py
+
+  create-next-release:
+    # After a good DEV deploy -> create qa_release_<date>
+    # After a good QA deploy  -> create prod_release_<date>
+    needs: [detect-env, deploy]
+    if: needs.deploy.result == 'success' && needs.detect-env.outputs.target_env != 'prod' && needs.detect-env.outputs.release_date != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create next release branch
+        env:
+          CURRENT_ENV: ${{ needs.detect-env.outputs.target_env }}
+          RELEASE_DATE: ${{ needs.detect-env.outputs.release_date }}
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          if [[ "$CURRENT_ENV" == "dev" ]]; then
+            NEXT="qa_release_${RELEASE_DATE}"; SOURCE="qa"
+          else
+            NEXT="prod_release_${RELEASE_DATE}"; SOURCE="main"
+          fi
+
+          if git ls-remote --exit-code --heads origin "$NEXT" > /dev/null; then
+            echo "Branch $NEXT already exists - skipping"
+          else
+            git push origin "origin/${SOURCE}:refs/heads/${NEXT}"
+            echo "SUCCESS: created $NEXT from $SOURCE"
+          fi
