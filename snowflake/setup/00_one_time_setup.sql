@@ -4,6 +4,15 @@
 USE ROLE ACCOUNTADMIN;
 
 -- 1) Small warehouse (auto-suspends to save credits)
+
+-- Give the role to YOU too, so you can run USE ROLE DEPLOY_ROLE in this worksheet
+EXECUTE IMMEDIATE $$
+BEGIN
+    EXECUTE IMMEDIATE 'GRANT ROLE DEPLOY_ROLE TO USER "' || CURRENT_USER() || '"';
+END;
+$$;
+
+
 CREATE WAREHOUSE IF NOT EXISTS DEMO_WH
   WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE;
 
