@@ -1,0 +1,6 @@
+-- Landing table: Snowpipe loads each JSON record here untouched
+CREATE TABLE IF NOT EXISTS RAW.WEATHER_RAW (
+  V          VARIANT,
+  FILE_NAME  STRING,
+  LOADED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);

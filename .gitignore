@@ -1,0 +1,5 @@
+*.p8
+*.pub
+*.pem
+.env
+__pycache__/
