@@ -1,0 +1,65 @@
+name: Diff Check
+
+on:
+  pull_request:
+    branches: [qa, "qa_release_*", main, "prod_release_*"]
+
+permissions:
+  contents: read
+
+jobs:
+  diff-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (this is the result of the merge)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare with the previous environment
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set +e
+          case "$BASE" in
+            qa|qa_release_*)     PRIOR="dev"; THIS="QA"   ;;
+            main|prod_release_*) PRIOR="qa";  THIS="PROD" ;;
+            *) echo "Nothing to check for base branch $BASE"; exit 0 ;;
+          esac
+          git fetch origin "$PRIOR"
+
+          DIRS="snowflake/tables snowflake/snowpipes snowflake/tasks"
+          git ls-tree -r --name-only "origin/$PRIOR" -- $DIRS | grep -i '\.sql$' | sort > /tmp/prior.txt
+          find $DIRS -type f -iname '*.sql' 2>/dev/null | sort > /tmp/here.txt
+
+          MISSING=$(comm -23 /tmp/prior.txt /tmp/here.txt)
+          NEW=$(comm -13 /tmp/prior.txt /tmp/here.txt)
+          DIFFERENT=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if ! diff -q <(git show "origin/$PRIOR:$f") "$f" > /dev/null; then
+              DIFFERENT="${DIFFERENT}${f}"$'\n'
+            fi
+          done < <(comm -12 /tmp/prior.txt /tmp/here.txt)
+
+          show() {
+            [ -z "$3" ] && return
+            echo ""; echo "### $1"; echo "$2"; echo ""
+            echo "$3" | sed 's/^/- `/; s/$/`/'
+          }
+
+          {
+            echo "## Diff check: $THIS (this PR after merge) vs $PRIOR"
+            show "Missing in this release" "These files exist in \`$PRIOR\` but are NOT here, so $THIS would not get the $PRIOR update." "$MISSING"
+            show "Not in $PRIOR" "These files are here but were never in \`$PRIOR\`, so they were not deployed or tested there first." "$NEW"
+            show "Different content" "Same file name, but the content is different from \`$PRIOR\`." "$DIFFERENT"
+            if [ -z "$MISSING$NEW$DIFFERENT" ]; then
+              echo ""; echo "All SQL files match \`$PRIOR\`. Safe to promote."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$MISSING$NEW$DIFFERENT" ]; then
+            echo ""
+            echo "FAILED: $THIS does not match $PRIOR. See the lists above."
+            exit 1
+          fi
