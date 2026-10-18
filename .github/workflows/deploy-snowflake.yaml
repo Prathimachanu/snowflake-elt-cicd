@@ -1,9 +1,8 @@
+
 name: Snowflake CI/CD
 
-# A deploy happens ONLY when a release branch is merged into dev / qa / main.
-# The merge commit message ("Merge pull request #N from user/dev_release_20261023")
-# tells the pipeline which environment and which release this is.
-# Pushes with any other message do NOT deploy (the deploy job is skipped).
+# Deploy when a qualifying release PR is merged into dev, qa, or main.
+# Manual runs also deploy and use today's UTC date if no release date is provided.
 
 on:
   push:
@@ -11,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       release_date:
-        description: "Optional release date YYYYMMDD (if given, the next release branch is created after deploy)"
+        description: "Optional release date YYYYMMDD. Defaults to today's UTC date."
         required: false
         type: string
 
@@ -29,39 +28,70 @@ jobs:
       should_deploy: ${{ steps.check.outputs.should_deploy }}
       target_env: ${{ steps.check.outputs.target_env }}
       release_date: ${{ steps.check.outputs.release_date }}
+
     steps:
       - id: check
+        name: Detect environment and release date
         env:
           BRANCH: ${{ github.ref_name }}
           EVENT: ${{ github.event_name }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           INPUT_DATE: ${{ github.event.inputs.release_date }}
         run: |
-          SHOULD_DEPLOY="false"; RELEASE_DATE=""
+          SHOULD_DEPLOY="false"
+          RELEASE_DATE=""
+
           case "$BRANCH" in
-            dev)  TARGET_ENV="dev";  PREFIX="dev_release"  ;;
-            qa)   TARGET_ENV="qa";   PREFIX="qa_release"   ;;
-            main) TARGET_ENV="prod"; PREFIX="prod_release" ;;
-            *)    TARGET_ENV="";     PREFIX=""             ;;
+            dev)
+              TARGET_ENV="dev"
+              PREFIX="dev_release"
+              ;;
+            qa)
+              TARGET_ENV="qa"
+              PREFIX="qa_release"
+              ;;
+            main)
+              TARGET_ENV="prod"
+              PREFIX="prod_release"
+              ;;
+            *)
+              TARGET_ENV=""
+              PREFIX=""
+              ;;
           esac
 
           if [[ -n "$TARGET_ENV" && "$EVENT" == "workflow_dispatch" ]]; then
-            SHOULD_DEPLOY="true"; RELEASE_DATE="$INPUT_DATE"
+            SHOULD_DEPLOY="true"
+            RELEASE_DATE="${INPUT_DATE:-$(date -u +%Y%m%d)}"
+
           elif [[ -n "$TARGET_ENV" && "$COMMIT_MSG" =~ ${PREFIX}_([0-9]{8}) ]]; then
-            SHOULD_DEPLOY="true"; RELEASE_DATE="${BASH_REMATCH[1]}"
+            SHOULD_DEPLOY="true"
+            RELEASE_DATE="${BASH_REMATCH[1]}"
           fi
 
-          echo "branch=$BRANCH env=$TARGET_ENV deploy=$SHOULD_DEPLOY release=$RELEASE_DATE"
+          # Validate the date before using it in a release branch name.
+          if [[ -n "$RELEASE_DATE" && ! "$RELEASE_DATE" =~ ^[0-9]{8}$ ]]; then
+            echo "ERROR: Release date must use YYYYMMDD format."
+            exit 1
+          fi
+
+          echo "Branch: $BRANCH"
+          echo "Environment: $TARGET_ENV"
+          echo "Deploy: $SHOULD_DEPLOY"
+          echo "Release date: $RELEASE_DATE"
+
           echo "should_deploy=$SHOULD_DEPLOY" >> "$GITHUB_OUTPUT"
-          echo "target_env=$TARGET_ENV"       >> "$GITHUB_OUTPUT"
-          echo "release_date=$RELEASE_DATE"   >> "$GITHUB_OUTPUT"
+          echo "target_env=$TARGET_ENV" >> "$GITHUB_OUTPUT"
+          echo "release_date=$RELEASE_DATE" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: detect-env
     if: needs.detect-env.outputs.should_deploy == 'true'
     runs-on: ubuntu-latest
-    # GitHub Environment (dev / qa / prod) = the approval gate.
+
+    # GitHub Environment approval gate: dev / qa / prod.
     environment: ${{ needs.detect-env.outputs.target_env }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -84,15 +114,23 @@ jobs:
         run: python scripts/deploy.py
 
   create-next-release:
-    # After a good DEV deploy -> create qa_release_<date>
-    # After a good QA deploy  -> create prod_release_<date>
+    # After successful DEV deployment: create qa_release_<date>.
+    # After successful QA deployment: create prod_release_<date>.
+    # Do not create a next release after production deployment.
     needs: [detect-env, deploy]
-    if: needs.deploy.result == 'success' && needs.detect-env.outputs.target_env != 'prod' && needs.detect-env.outputs.release_date != ''
+
+    if: >-
+      needs.deploy.result == 'success' &&
+      needs.detect-env.outputs.target_env != 'prod'
+
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -101,18 +139,35 @@ jobs:
           CURRENT_ENV: ${{ needs.detect-env.outputs.target_env }}
           RELEASE_DATE: ${{ needs.detect-env.outputs.release_date }}
         run: |
+          set -e
+
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
 
-          if [[ "$CURRENT_ENV" == "dev" ]]; then
-            NEXT="qa_release_${RELEASE_DATE}"; SOURCE="qa"
-          else
-            NEXT="prod_release_${RELEASE_DATE}"; SOURCE="main"
+          if [[ -z "$RELEASE_DATE" ]]; then
+            echo "ERROR: Release date is empty. Cannot create release branch."
+            exit 1
           fi
 
-          if git ls-remote --exit-code --heads origin "$NEXT" > /dev/null; then
-            echo "Branch $NEXT already exists - skipping"
+          if [[ "$CURRENT_ENV" == "dev" ]]; then
+            NEXT="qa_release_${RELEASE_DATE}"
+            SOURCE="qa"
+          elif [[ "$CURRENT_ENV" == "qa" ]]; then
+            NEXT="prod_release_${RELEASE_DATE}"
+            SOURCE="main"
           else
+            echo "No next release branch is required for $CURRENT_ENV."
+            exit 0
+          fi
+
+          # Refresh remote branch information.
+          git fetch origin "$SOURCE"
+
+          # Do not overwrite an existing release branch.
+          if git ls-remote --exit-code --heads origin "$NEXT" > /dev/null 2>&1; then
+            echo "Branch $NEXT already exists. Skipping creation."
+          else
+            # Create the release branch from the intended source branch.
             git push origin "origin/${SOURCE}:refs/heads/${NEXT}"
-            echo "SUCCESS: created $NEXT from $SOURCE"
+            echo "SUCCESS: Created $NEXT from $SOURCE."
           fi
