@@ -1,0 +1,36 @@
+name: Airflow DAG CI/CD
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "aws/airflow/dags/**"
+      - ".github/workflows/deploy-airflow.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check DAG files have no syntax errors
+        run: python -m py_compile aws/airflow/dags/*.py
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Copy DAGs to S3
+        run: aws s3 sync aws/airflow/dags s3://${{ secrets.S3_BUCKET }}/airflow/dags --delete --exclude "__pycache__/*"
